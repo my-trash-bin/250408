@@ -1,8 +1,8 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { lexicalEditor } from '@payloadcms/richtext-lexical'
+import { approvalSystem } from 'approval-system'
 import path from 'path'
 import { buildConfig } from 'payload'
-import { approvalSystem } from 'approval-system'
 import sharp from 'sharp'
 import { fileURLToPath } from 'url'
 
@@ -26,15 +26,41 @@ export default buildConfig({
   },
   collections: [
     {
-      slug: 'posts',
-      fields: [],
-    },
-    {
-      slug: 'media',
-      fields: [],
-      upload: {
-        staticDir: path.resolve(dirname, 'media'),
-      },
+      slug: 'documents',
+      fields: [
+        { name: 'title', type: 'text' },
+        { name: 'content', type: 'textarea' },
+
+        {
+          name: 'approvalFlow',
+          type: 'array',
+          fields: [
+            { name: 'level', type: 'number' },
+            {
+              name: 'status',
+              type: 'select',
+              defaultValue: 'pending',
+              options: ['pending', 'approved', 'rejected'],
+            },
+            { name: 'reviewedBy', type: 'relationship', relationTo: 'users' },
+            { name: 'comment', type: 'textarea' },
+            { name: 'timestamp', type: 'date' },
+          ],
+        },
+
+        {
+          name: 'currentApprovalLevel',
+          type: 'number',
+          defaultValue: 1,
+        },
+
+        {
+          name: 'finalStatus',
+          type: 'select',
+          defaultValue: 'pending',
+          options: ['pending', 'approved', 'rejected'],
+        },
+      ],
     },
   ],
   db: mongooseAdapter({

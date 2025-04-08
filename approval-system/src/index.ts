@@ -1,113 +1,133 @@
-import type { CollectionSlug, Config } from 'payload'
+import type {
+  BeforeChangeHook,
+  TypeWithID,
+} from 'node_modules/payload/dist/collections/config/types.js'
+import type { CollectionConfig, Config, Plugin } from 'payload'
 
-export type ApprovalSystemConfig = {
-  /**
-   * List of collections to add a custom field
-   */
-  collections?: Partial<Record<CollectionSlug, true>>
-  disabled?: boolean
+type RoleLevelMap = Record<string, number>
+
+interface ApprovalSystemOptions {
+  collection: string
+  levels: RoleLevelMap
 }
 
-export const approvalSystem =
-  (pluginOptions: ApprovalSystemConfig) =>
-  (config: Config): Config => {
-    if (!config.collections) {
-      config.collections = []
-    }
-
-    config.collections.push({
-      slug: 'plugin-collection',
-      fields: [
-        {
-          name: 'id',
-          type: 'text',
-        },
-      ],
-    })
-
-    if (pluginOptions.collections) {
-      for (const collectionSlug in pluginOptions.collections) {
-        const collection = config.collections.find(
-          (collection) => collection.slug === collectionSlug,
-        )
-
-        if (collection) {
-          collection.fields.push({
-            name: 'addedByPlugin',
-            type: 'text',
-            admin: {
-              position: 'sidebar',
-            },
-          })
-        }
+export const approvalSystem = ({ collection, levels }: ApprovalSystemOptions): Plugin => {
+  return (config: Config): Config => {
+    const targetCollection = (() => {
+      const result = config.collections?.find((c) => c.slug === collection)
+      if (!result) {
+        config.collections ??= []
+        const result: CollectionConfig = { slug: collection, fields: [] }
+        config.collections.push(result)
+        return result
       }
-    }
+      return result
+    })()
 
-    /**
-     * If the plugin is disabled, we still want to keep added collections/fields so the database schema is consistent which is important for migrations.
-     * If your plugin heavily modifies the database schema, you may want to remove this property.
-     */
-    if (pluginOptions.disabled) {
-      return config
-    }
-
-    if (!config.endpoints) {
-      config.endpoints = []
-    }
-
-    if (!config.admin) {
-      config.admin = {}
-    }
-
-    if (!config.admin.components) {
-      config.admin.components = {}
-    }
-
-    if (!config.admin.components.beforeDashboard) {
-      config.admin.components.beforeDashboard = []
-    }
-
-    config.admin.components.beforeDashboard.push(
-      `approval-system/client#BeforeDashboardClient`,
-    )
-    config.admin.components.beforeDashboard.push(
-      `approval-system/rsc#BeforeDashboardServer`,
-    )
-
-    config.endpoints.push({
-      handler: () => {
-        return Response.json({ message: 'Hello from custom endpoint' })
+    // Add approval fields
+    targetCollection.fields = [
+      ...targetCollection.fields,
+      {
+        name: 'approvalFlow',
+        type: 'array',
+        fields: [
+          { name: 'level', type: 'number' },
+          {
+            name: 'status',
+            type: 'select',
+            defaultValue: 'pending',
+            options: ['pending', 'approved', 'rejected'],
+          },
+          { name: 'reviewedBy', type: 'relationship', relationTo: 'users' },
+          { name: 'comment', type: 'textarea' },
+          { name: 'timestamp', type: 'date' },
+        ],
       },
-      method: 'get',
-      path: '/my-plugin-endpoint',
-    })
+      {
+        name: 'currentApprovalLevel',
+        type: 'number',
+        defaultValue: 1,
+      },
+      {
+        name: 'finalStatus',
+        type: 'select',
+        defaultValue: 'pending',
+        options: ['pending', 'approved', 'rejected'],
+      },
+    ]
 
-    const incomingOnInit = config.onInit
-
-    config.onInit = async (payload) => {
-      // Ensure we are executing any existing onInit functions before running our own.
-      if (incomingOnInit) {
-        await incomingOnInit(payload)
-      }
-
-      const { totalDocs } = await payload.count({
-        collection: 'plugin-collection',
-        where: {
-          id: {
-            equals: 'seeded-by-plugin',
-          },
-        },
-      })
-
-      if (totalDocs === 0) {
-        await payload.create({
-          collection: 'plugin-collection',
-          data: {
-            id: 'seeded-by-plugin',
-          },
-        })
-      }
+    // Add hooks
+    targetCollection.hooks = {
+      ...targetCollection.hooks,
+      beforeChange: [...(targetCollection.hooks?.beforeChange || []), approvalHook(levels)],
     }
 
     return config
+  }
+}
+
+interface Document extends TypeWithID {
+  approvalFlow: ApprovalStep[]
+  currentApprovalLevel: number
+  finalStatus: 'approved' | 'pending' | 'rejected'
+}
+
+interface ApprovalStep {
+  comment?: string
+  level: number
+  reviewedBy?: string
+  status: 'approved' | 'pending' | 'rejected'
+  timestamp?: string
+}
+
+export const approvalHook =
+  (levels: Record<string, number>): BeforeChangeHook<Document> =>
+  ({ data, originalDoc, req }) => {
+    if (!req?.user) {
+      throw new Error('User not authenticated')
+    }
+
+    const user = req.user
+    const userLevel = levels[user.role]
+
+    if (!originalDoc || !Array.isArray(originalDoc.approvalFlow)) {
+      throw new Error('Original document or approvalFlow missing')
+    }
+
+    const originalApprovalFlow: ApprovalStep[] = originalDoc.approvalFlow
+
+    const updatedIndex = originalApprovalFlow.findIndex((step) => step.level === userLevel)
+
+    if (updatedIndex >= 0) {
+      const newStatus = data.approvalFlow?.[updatedIndex]?.status
+      if (!newStatus) {
+        throw new Error('newState must be changed')
+      }
+
+      data.approvalFlow = [...originalApprovalFlow]
+      data.approvalFlow[updatedIndex] = {
+        ...originalApprovalFlow[updatedIndex],
+        reviewedBy: user.id.toString(),
+        status: newStatus,
+        timestamp: new Date().toISOString(),
+      }
+
+      if (newStatus === 'approved') {
+        const nextStep = originalApprovalFlow.find(
+          (step) => step.level > userLevel && step.status === 'pending',
+        )
+
+        if (nextStep) {
+          data.currentApprovalLevel = nextStep.level
+        } else {
+          data.finalStatus = 'approved'
+        }
+      }
+
+      if (newStatus === 'rejected') {
+        data.finalStatus = 'rejected'
+      }
+    }
+
+    return data
   }
